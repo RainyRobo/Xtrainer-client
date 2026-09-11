@@ -1,275 +1,204 @@
 #!/usr/bin/env python3
+"""Drive the arms from a remote StarVLA policy server.
+
+Loop: read a ROS observation, send three camera views plus the 16-D
+end-effector state over websocket, receive a chunk of absolute 16-D
+end-effector commands, publish them at the control rate.
+
+The server owns normalization and the wxyz/xyzw quaternion conversion, so
+everything on this side stays in the robot's own units. The layout is defined
+in ``vla/xtrainer2_contract.py``.
+"""
 import _bootstrap  # noqa: F401  process-local path only; does not affect other users
 
-import time
+import argparse
 import math
 import threading
-import argparse
+import time
+
 import numpy as np
 import rospy
-import cv2
 
-from data_pipeline.tools.robot_action import RobotAction, ComponentAction
+from data_pipeline.tools.robot_action import ComponentAction, RobotAction
 from data_pipeline.tools.robot_ros_client import RobotRosClient
+from vla.xtrainer2_contract import CAMERA_ORDER, DEFAULT_INSTRUCTION, split_action
+from vla.xtrainer2_policy import PolicyBridge, check_first_step
 
-from vla.third_party.openpi_client import websocket_client_policy as _websocket_client_policy
-
-url : str = "server_url"
-policy_client = _websocket_client_policy.WebsocketClientPolicy(url)
 _G_ACTION_LIST = []
-
-START_TIME = None
-
-
-def infer(obs, policy_client, use_tactile):
-    for cam_img in obs.camera_images:
-        if cam_img.image is None:
-            continue
-
-    for chain_img in obs.chain_images:
-        if chain_img.color_image is None:
-            continue
-
-    cam_left_wrist = np.transpose(cv2.resize(obs.chain_images[1].color_image, (224, 224)), (2, 0, 1))
-    cam_right_wrist = np.transpose(cv2.resize(obs.chain_images[2].color_image, (224, 224)), (2, 0, 1))
-    resized_color = cv2.resize(obs.chain_images[0].color_image, (224, 224))
-    cam_high = np.transpose(resized_color, (2, 0, 1))
-
-    obs_ee_pose_left = np.array(obs.get_observation(
-        name='left_arm').multibody_state)  # (7,)
-    obs_gripper_left = obs.get_observation(
-        name='left_hand').multibody_state  # (1,)
-    obs_ee_pose_right = np.array(obs.get_observation(
-        name='right_arm').multibody_state)  # (7,)
-    obs_gripper_right = obs.get_observation(
-        name='right_hand').multibody_state  # (1,)
-
-    state = np.concatenate((obs_ee_pose_left, obs_gripper_left, obs_ee_pose_right, obs_gripper_right), axis=0)
-
-    element = {
-        "state": state,
-        "images": {
-            "cam_high": cam_high,
-            "cam_left_wrist": cam_left_wrist,
-            "cam_right_wrist": cam_right_wrist,
-        },
-        "prompt": "put the objects in the box",
-    }
-
-    start = time.time()
-    action_chunk = policy_client.infer(element)["actions"]
-    end = time.time()
-
-    print('action_chunk', action_chunk.shape, 'time', end - start)  # (50, 16)
-    return action_chunk
+lock = threading.Lock()
 
 
-def generate_action(cur_action):
+def generate_action(cur_action, pose_frame):
+    """Turn one 16-D server action into a ROS ``RobotAction``."""
+    left_pose, left_gripper, right_pose, right_gripper = split_action(cur_action)
+
     actions = RobotAction()
-    act_ee_pose_left = cur_action[0:6]
-    act_gripper_left = cur_action[6]
-    act_ee_pose_right = cur_action[7:13]
-    act_gripper_right = cur_action[13]
+    for name, pose in (('left_arm', left_pose), ('right_arm', right_pose)):
+        arm_action = ComponentAction()
+        arm_action.name = name
+        arm_action.pose_command = ComponentAction.Pose(np.array(pose), pose_frame)
+        arm_action.joint_commands = None
+        arm_action.duration = 0.0
+        actions.actions.append(arm_action)
 
-    left_arm_action = ComponentAction()
-    left_arm_action.name = 'left_arm'
-    left_arm_action.joint_commands = np.array(act_ee_pose_left)
-    left_arm_action.pose_command = None
-    left_arm_action.duration = 0.0
-    actions.actions.append(left_arm_action)
-
-    right_arm_action = ComponentAction()
-    right_arm_action.name = 'right_arm'
-    right_arm_action.joint_commands = np.array(act_ee_pose_right)
-    right_arm_action.pose_command = None
-    right_arm_action.duration = 0.0
-    actions.actions.append(right_arm_action)
-
-    left_hand_action = ComponentAction()
-    left_hand_action.name = 'left_hand'
-    left_hand_action.joint_commands = np.array([act_gripper_left])
-    left_hand_action.pose_command = None
-    left_hand_action.duration = 0.0
-    actions.actions.append(left_hand_action)
-
-    right_hand_action = ComponentAction()
-    right_hand_action.name = 'right_hand'
-    right_hand_action.joint_commands = np.array([act_gripper_right])
-    right_hand_action.pose_command = None
-    right_hand_action.duration = 0.0
-    actions.actions.append(right_hand_action)
+    # Grippers stay continuous; binarizing them changes the learned behaviour.
+    for name, opening in (('left_hand', left_gripper), ('right_hand', right_gripper)):
+        hand_action = ComponentAction()
+        hand_action.name = name
+        hand_action.pose_command = None
+        hand_action.joint_commands = np.array([opening])
+        hand_action.duration = 0.0
+        actions.actions.append(hand_action)
 
     actions.timestamp = rospy.Time.now().to_sec()
     return actions
 
 
-def deploy_policy(bag_path, rate, use_tactile=False, end_sec=None,
-                  use_rosbag_obs=False, use_rosbag_act=False, use_force_control=False):
+def read_observation(client, decoder, start_time):
+    """Live observation, or the replayed one for the elapsed 20 ms slot."""
+    if decoder is None:
+        return client.get_observation(display_image=False)
+    index = round((time.time() - start_time) * 1000 / 20.0)
+    if index >= len(decoder.observations):
+        return None
+    return decoder.observations[index]
 
-    if bag_path != '':
-        from data_pipeline.tools.robot_rosbag_decoder import RobotRosbagDecoder
-        decoder = RobotRosbagDecoder()
-        decoder.decode(bag_path, insert_previous_data=True)
-        rosbag_count = 0
 
-    global START_TIME
-    if START_TIME is None:
-        START_TIME = time.time()
+def deploy_policy(bridge, client, decoder, rate_hz, pose_frame, steps_per_chunk, max_jump):
+    """Serial loop: one inference, then execute part of the chunk, then repeat."""
+    rate = rospy.Rate(rate_hz)
+    start_time = time.time()
 
-    client = RobotRosClient(frame_id='robot_ros_client')  # client = None
-    rate = rospy.Rate(rate)
-
-    while True:
-        if rospy.is_shutdown():
-            break
-
-        if not use_rosbag_obs:
-            # use realtime obs
-            obs = client.get_observation(display_image=False)
-        else:
-            # use obs from rosbag
-            rosbag_count = round((time.time() - START_TIME) * 1000 / 20.0)
-            obs = decoder.observations[rosbag_count]
-
-        action_chunk = infer(obs, policy_client, use_tactile)
-
-        for act_i in range(25):  # 20 or action_chunk.shape[0] (50)
-
-            if use_rosbag_act:
-                rosbag_count = round((time.time() - START_TIME) * 1000 / 20.0)
-                actions = decoder.actions[rosbag_count]
-            else:
-                actions = generate_action(action_chunk[act_i])
-
-            # print('debug mode: not sending actions to the robot')
-            if client is not None:
-                client.send_action(actions)
-
+    while not rospy.is_shutdown():
+        obs = read_observation(client, decoder, start_time)
+        if obs is None:
             rate.sleep()
+            continue
 
-            if bag_path != '':
-                print('rosbag_count', rosbag_count)
+        example = bridge.build_example(obs)
+        action_chunk = bridge.infer(example)
+        check_first_step(action_chunk[0], example["state"], max_jump)
 
-        if obs is not None:
-            print(obs)
-        rate.sleep()
+        executed = min(steps_per_chunk or bridge.action_chunk_size, len(action_chunk))
+        for act_i in range(executed):
+            client.send_action(generate_action(action_chunk[act_i], pose_frame))
+            rate.sleep()
     print('deploy policy done.')
 
 
-def policy_infer_thread(client, decoder, infer_rate, act_rate, use_rosbag_act=False, use_tactile=False):
-    rosbag_count = 0
-    cur_obs_t = time.time()
-    global START_TIME
-    if START_TIME is None:
-        START_TIME = time.time()
-
+def policy_infer_thread(bridge, client, decoder, infer_rate, act_rate, max_jump):
     global _G_ACTION_LIST
-    while True:
+    start_time = time.time()
+    while not rospy.is_shutdown():
         loop_start = time.time()
-        if rospy.is_shutdown():
-            break
+        obs = read_observation(client, decoder, start_time)
+        if obs is None:
+            time.sleep(1.0 / infer_rate)
+            continue
 
-        if client is not None:
-            # use realtime obs
-            obs = client.get_observation(display_image=False)
-            # print('obs timestamp', time.time())
-        elif decoder is not None:
-            # use obs from rosbag
-            rosbag_count = round((time.time() - START_TIME) * 1000 / 20.0)
-            obs = decoder.observations[rosbag_count]
-        else:
-            print('Can not get observation without both client and decoder')
+        example = bridge.build_example(obs)
+        obs_time = time.time()
+        action_chunk = bridge.infer(example)
+        check_first_step(action_chunk[0], example["state"], max_jump)
+        action_chunk = action_chunk.tolist()
 
-        # print(f'obs: {time.time() - cur_obs_t}')
-
-        cur_obs_t = time.time()
-
-        action_chunk = None
-        # infer_start = time.time()
-        if use_rosbag_act and decoder is not None:
-            rosbag_count = round((time.time() - START_TIME) * 1000 / 20.0)
-            action_chunk = [decoder.actions[rosbag_count]]
-        else:
-            action_chunk = infer(obs, policy_client, use_tactile).tolist()
-        # print(f'infer: {time.time() - infer_start}')
-        lock.acquire()
-        cur_len = len(_G_ACTION_LIST)
-        if cur_len == 0:
-            _G_ACTION_LIST = action_chunk.copy()
-        else:
-            # print(f'infer - obs: {time.time() - cur_obs_t}')
-            removed_len = math.ceil((time.time() - cur_obs_t) * act_rate)
-            print('action chunk removed_len', removed_len)
-
-            if removed_len < len(action_chunk):
-                _G_ACTION_LIST = action_chunk[removed_len:]
+        with lock:
+            if len(_G_ACTION_LIST) == 0:
+                _G_ACTION_LIST = action_chunk.copy()
             else:
-                print(f'Predicted action length {len(action_chunk)} too less')
+                # Drop the steps that elapsed while the server was thinking.
+                removed_len = math.ceil((time.time() - obs_time) * act_rate)
+                if removed_len < len(action_chunk):
+                    _G_ACTION_LIST = action_chunk[removed_len:]
+                else:
+                    print(f'Predicted action length {len(action_chunk)} too short '
+                          f'for {removed_len} elapsed steps')
 
-        lock.release()
-        if decoder is not None:
-            print('rosbag_count', rosbag_count)
         sleep_sec = (1 / infer_rate) - (time.time() - loop_start)
         if sleep_sec > 0:
             time.sleep(sleep_sec)
-            print(f'sleep: {sleep_sec}')
-        print(f'loop: {time.time() - loop_start}')
     print('deploy policy done.')
 
 
-def send_action_thread(client, rate, use_force_control=False):
+def send_action_thread(client, rate_hz, pose_frame):
     global _G_ACTION_LIST
-    ros_rate = rospy.Rate(rate)
+    ros_rate = rospy.Rate(rate_hz)
     while not rospy.is_shutdown():
         ros_rate.sleep()
-        cur_action = None
-        lock.acquire()
-        if len(_G_ACTION_LIST) != 0:
-            cur_action = _G_ACTION_LIST.pop(0)
-        lock.release()
+        with lock:
+            cur_action = _G_ACTION_LIST.pop(0) if _G_ACTION_LIST else None
         if cur_action is None:
             print('Empty action list')
             continue
-
-        actions = RobotAction()
-        if isinstance(cur_action, RobotAction):
-            actions = cur_action
-            actions.timestamp = rospy.Time.now().to_sec()
-        else:
-            actions = generate_action(cur_action)
-
-        if client is not None:
-            client.send_action(actions)
-            pass
-
+        client.send_action(generate_action(cur_action, pose_frame))
     print('send action done.')
 
 
-if __name__ == '__main__':
-    rospy.init_node('robot_ros_client_example', anonymous=True)
-    rospy.loginfo("Ros node has been initialized")
-    parser = argparse.ArgumentParser(description='Parameters from command line')
-    # parser.add_argument('--bag_path', type=str, help='ros bag path', default='20250721-135113.bag')
-    parser.add_argument('--bag_path', type=str, help='ros bag path', default='')
-    parser.add_argument('--rate', type=float, help='action excution rate', default=10)  # 26, 28 or 27
-    parser.add_argument('--parallel', type=bool, help='infer and execute on parallel', default=False)
-    _ARGS, _ = parser.parse_known_args()
-    if _ARGS.parallel:
-        print('parallel inference')
-        client = RobotRosClient(frame_id='robot_ros_client')  # client = None
-        DECODER = None
-        if _ARGS.bag_path != '':
-            from data_pipeline.tools.robot_rosbag_decoder import RobotRosbagDecoder
-            DECODER = RobotRosbagDecoder()
-            DECODER.decode(_ARGS.bag_path, insert_previous_data=True)
+def build_argparser():
+    parser = argparse.ArgumentParser(description='xtrainer2 on-robot VLA client')
+    parser.add_argument('--url', type=str, required=True,
+                        help='policy server, e.g. ws://10.0.0.5:10093')
+    parser.add_argument('--instruction', type=str, default=DEFAULT_INSTRUCTION,
+                        help='must be the English instruction the model was trained on')
+    parser.add_argument('--unnorm_key', type=str, default=None,
+                        help='only needed for multi-dataset checkpoints')
+    parser.add_argument('--rate', type=float, default=10,
+                        help='action execution rate; the datasets are 10 Hz')
+    parser.add_argument('--infer-rate', type=float, default=4.0,
+                        help='inference rate in --parallel mode')
+    parser.add_argument('--steps-per-chunk', type=int, default=0,
+                        help='steps executed per chunk in serial mode (0 = whole chunk)')
+    parser.add_argument('--parallel', action='store_true',
+                        help='infer and execute in separate threads')
+    parser.add_argument('--pose-frame', type=str, default='TorsoEe',
+                        choices=['TorsoEe', 'TorsoTool'],
+                        help='frame of the commanded end-effector pose')
+    parser.add_argument('--max-first-step-jump', type=float, default=0.15,
+                        help='metres; refuse a chunk whose first step is farther '
+                             'than this from the current pose (0 disables)')
+    parser.add_argument('--bag-path', type=str, default='',
+                        help='replay observations from a rosbag/mcap instead of the live robot')
+    for camera in CAMERA_ORDER:
+        parser.add_argument(f'--{camera.replace("_", "-")}', type=str, default=None,
+                            help=f'chain-image frame id or index for {camera}')
+    return parser
 
-        lock = threading.Lock()
-        action_thread = threading.Thread(target=send_action_thread, args=(client, _ARGS.rate, False))
+
+def main():
+    args = build_argparser().parse_args()
+    rospy.init_node('robot_ros_client_example', anonymous=True)
+    rospy.loginfo('Ros node has been initialized')
+
+    camera_overrides = {
+        camera: getattr(args, camera) for camera in CAMERA_ORDER
+        if getattr(args, camera) is not None
+    }
+    bridge = PolicyBridge(
+        url=args.url,
+        instruction=args.instruction,
+        unnorm_key=args.unnorm_key,
+        camera_overrides=camera_overrides,
+    )
+    print(f'[client] pose frame {args.pose_frame}, execution rate {args.rate} Hz')
+
+    decoder = None
+    if args.bag_path:
+        from data_pipeline.tools.robot_rosbag_decoder import RobotRosbagDecoder
+        decoder = RobotRosbagDecoder()
+        decoder.decode(args.bag_path, insert_previous_data=True)
+        print(f'[client] replaying observations from {args.bag_path}')
+
+    client = RobotRosClient(frame_id='robot_ros_client')
+    if args.parallel:
+        action_thread = threading.Thread(
+            target=send_action_thread, args=(client, args.rate, args.pose_frame))
         action_thread.daemon = True
         action_thread.start()
 
-        policy_thread = threading.Thread(target=policy_infer_thread, args=(
-            client, DECODER, 4.0, _ARGS.rate))  # 4 is model infer frequence
+        policy_thread = threading.Thread(
+            target=policy_infer_thread,
+            args=(bridge, client, decoder, args.infer_rate, args.rate,
+                  args.max_first_step_jump))
         policy_thread.daemon = True
         policy_thread.start()
 
@@ -277,6 +206,9 @@ if __name__ == '__main__':
         action_thread.join()
         policy_thread.join()
     else:
-        print('serial inference')
-        deploy_policy(_ARGS.bag_path, _ARGS.rate, use_tactile=False, use_force_control=False,
-                      use_rosbag_obs=False, use_rosbag_act=False)
+        deploy_policy(bridge, client, decoder, args.rate, args.pose_frame,
+                      args.steps_per_chunk, args.max_first_step_jump)
+
+
+if __name__ == '__main__':
+    main()
