@@ -3,15 +3,10 @@
 Runs without ROS: it exercises only ``vla/xtrainer2_contract.py``.
 """
 
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from vla.xtrainer2_contract import (  # noqa: E402
+from vla.xtrainer2_contract import (
     ACTION_DIM,
     CAMERA_ORDER,
     STATE_DIM,

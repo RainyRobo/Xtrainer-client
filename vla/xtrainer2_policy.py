@@ -27,13 +27,14 @@ class PolicyBridge:
     """Turns a ROS observation into a request and a response into commands."""
 
     def __init__(self, url, instruction=DEFAULT_INSTRUCTION, unnorm_key=None,
-                 camera_overrides=None, client=None):
+                 camera_overrides=None, client=None, connect_timeout=None):
         self.instruction = instruction
         self.unnorm_key = unnorm_key
         self.camera_overrides = camera_overrides or {}
         self._camera_indices = None
 
-        self.client = client or _websocket_client_policy.WebsocketClientPolicy(url)
+        self.client = client or _websocket_client_policy.WebsocketClientPolicy(
+            url, connect_timeout=connect_timeout)
         self.metadata = self.client.get_server_metadata()
         check_server_metadata(self.metadata)
         self.action_chunk_size = int(self.metadata.get("action_chunk_size", 0))
@@ -44,8 +45,11 @@ class PolicyBridge:
               f'instruction="{self.instruction}"')
 
     def camera_indices(self, obs):
+        frame_ids = [img.frame_id for img in (obs.chain_images or [])]
+        if len(frame_ids) < len(CAMERA_ORDER):
+            raise ValueError(
+                f'need {len(CAMERA_ORDER)} chain images, got {frame_ids}')
         if self._camera_indices is None:
-            frame_ids = [img.frame_id for img in obs.chain_images]
             self._camera_indices = resolve_camera_indices(frame_ids, self.camera_overrides)
             print(f'[policy] chain images {frame_ids} -> {self._camera_indices}')
         return self._camera_indices
@@ -105,7 +109,7 @@ def check_first_step(action, state, max_jump):
             raise RuntimeError(
                 f'{name} arm: first commanded position is {distance:.3f} m from the current '
                 f'pose (limit {max_jump:.3f} m). Refusing to send. '
-                'Check --pose-frame, the checkpoint and the camera mapping, '
+                'Check --pose-frame (TorsoEE), the checkpoint and the camera mapping, '
                 'or raise --max-first-step-jump if this is intended.'
             )
 

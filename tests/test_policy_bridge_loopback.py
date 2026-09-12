@@ -5,16 +5,10 @@ envelope), so this catches an envelope or key rename on either side. What it
 cannot catch is a wrong checkpoint; that is what the metadata check is for.
 """
 
-import sys
 import threading
-from pathlib import Path
 
 import numpy as np
 import pytest
-
-CLIENT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(CLIENT_ROOT))
-sys.path.insert(0, str(CLIENT_ROOT / "vendor"))
 
 cv2 = pytest.importorskip("cv2")
 websockets_sync_server = pytest.importorskip("websockets.sync.server")

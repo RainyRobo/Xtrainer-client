@@ -16,8 +16,9 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
     See WebsocketPolicyServer for a corresponding server implementation.
     """
 
-    def __init__(self, url: str = "ws://0.0.0.0:8000") -> None:
+    def __init__(self, url: str = "ws://0.0.0.0:8000", connect_timeout: float = None) -> None:
         self._uri = url
+        self._connect_timeout = connect_timeout
         self._packer = msgpack_numpy.Packer()
         self._ws, self._server_metadata = self._wait_for_server()
 
@@ -26,6 +27,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
 
     def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
         logging.info(f"Waiting for server at {self._uri}...")
+        deadline = None if self._connect_timeout is None else time.time() + self._connect_timeout
         while True:
             try:
                 ssl_context = None
@@ -35,6 +37,11 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
             except ConnectionRefusedError:
+                if deadline is not None and time.time() >= deadline:
+                    raise TimeoutError(
+                        f"policy server at {self._uri} refused the connection "
+                        f"for {self._connect_timeout:.0f}s"
+                    )
                 logging.info("Still waiting for server...")
                 time.sleep(5)
 

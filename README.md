@@ -4,19 +4,37 @@
 
 ## 布局
 
+```
+inference_xtrainer.py   正式推理入口
+_bootstrap.py           进程内 sys.path 设置
+tools/                  辅助脚本（预检、手写控制、假服务端、看相机）
+scripts/                起本体：run_collection.sh + dobot 配置快照
+vla/                    与服务端的数据约定、组包、WebSocket 桥
+deps/                   不是我们写的：ROS 消息包、data_pipeline、vendor
+tests/                  脱机测试
+docs/                   ROS 控制入门与踩坑记录
+```
+
 | 路径 | 作用 |
 |---|---|
 | `inference_xtrainer.py` | 入口：ROS 控制循环、串行/并行发送 |
-| `vla/xtrainer2_contract.py` | 与服务端约定的数据布局（纯 numpy，可脱机测试） |
-| `vla/xtrainer2_policy.py` | WebSocket 桥：组请求、解响应、安全检查（不依赖 ROS） |
-| `data_pipeline/tools/` | ROS 客户端、观测/动作结构、消息转换 |
-| `vla/third_party/openpi_client/` | OpenPI WebSocket + msgpack 协议 |
-| `data_msgs/` 等 `*_msgs` | ROS 消息（需在有 ROS 的机器上使用） |
-| `vendor/` | 本进程自带的 `websockets` / `msgpack` |
-| `_bootstrap.py` | 仅把本目录和 `vendor` 加入当前进程 `sys.path` |
-| `tests/` | 脱机测试：布局、相机匹配、握手校验、WebSocket 回环 |
+| `tools/probe_xtrainer.py` | 上机前预检：模拟/真机观测、可选一次推理，不发动作 |
+| `tools/simple_control.py` | 手写 `/robot/actions`：读状态、夹爪、小幅移臂（学 SDK 用） |
+| `tools/fake_policy_server.py` | 假策略服务端：真 WebSocket 协议，只做微小夹爪动作 |
+| `tools/view_cameras.py` | 实时看三路 chain 相机（需要 DISPLAY） |
+| `scripts/run_collection.sh` | **宿主机桌面**起本体（GUI + `xtrainer_main`），不依赖别人的 checkout |
+| `scripts/usbreset.sh` | 宿主机 USB 复位三台 Orbbec Gemini 305；复位后要重新起本体 |
+| `scripts/dobot_config/` | 本机 dobot 配置快照；启动时写入 `/data/robotics.install` |
+| `vla/xtrainer2_contract.py` | 16 维布局、相机顺序、握手校验（纯 numpy） |
+| `vla/xtrainer2_actions.py` | 16 维 → 四部件 `RobotAction` 组包 |
+| `vla/xtrainer2_policy.py` | WebSocket 桥：组请求、解响应、首步跳变保护 |
+| `deps/data_pipeline/` | 厂商 ROS 客户端、观测/动作结构、消息转换 |
+| `deps/*_msgs/` | ROS 消息包；容器里会被 `.live_ros_msgs` 链到安装树 |
+| `deps/vendor/` | 兜底的 `websockets` / `msgpack`（容器 3.8 用系统自带版本） |
+| `docs/ros_control.md` | 新人：ROS 话题、消息格式、上手命令、已踩过的坑 |
 
-本仓库以 git submodule 的形式被 StarVLA 引用，不需要把文件拷到模型仓库。
+`deps/` 里的包仍按自己的顶层名导入（`import data_msgs`、`import data_pipeline...`）：
+`_bootstrap.py` 把 `deps/` 本身加进 `sys.path`，所以目录可以收起来而不改任何 import。
 
 ## 与服务端的约定
 
@@ -32,27 +50,65 @@
 连接时会用握手 metadata 校验以上各项，不匹配就直接报错退出。
 细节见 StarVLA 仓库 `examples/Xtrainer2/README.md` 的 "Deployment contract"。
 
-## 运行
+## 这台机上的工作流（xtrainer2）
 
-完整步骤（GPU 服务端 + 本客户端、参数、上机顺序、常见失败）见 StarVLA 仓库
-`examples/Xtrainer2/INFERENCE.md`。
+三套东西不要混：
 
-需要已 source 的 ROS 环境，以及可达的策略服务地址。
+| 东西 | 是什么 | 不是什么 |
+|---|---|---|
+| 本仓库 `scripts/run_collection.sh` | 机械臂 / 相机 / `/robot/observations` 的 **ROS1 Noetic 运行时** | 不是 StarVLA；不要再用别人家里的同名脚本 |
+| `run_inference_sdk.sh` | 站内旧 HyVLA/π0 推理 | 不要用来测本仓库 |
+| 本仓库 `tools/probe_xtrainer.py` / `inference_xtrainer.py` | StarVLA 的机上 client | 宿主机 Humble 里跑不了 rospy |
+
+Docker 和机械臂一起升。容器把 **`/data` 挂进去**，把 **`/home/x` 盖成空 tmpfs**，所以 client 必须在 `/data/...`，不能只放在 `~/arianliu/client`。
+
+当前拷贝位置：`/data/arianliu/client`。
+
+### 终端怎么分
+
+**终端 A（有桌面 DISPLAY，起本体）**
 
 ```bash
-python3 inference_xtrainer.py --url ws://<server-ip>:10093 --rate 10
-python3 inference_xtrainer.py --url ws://<server-ip>:10093 --parallel --rate 10
+cd ~/arianliu/client
+./scripts/run_collection.sh
 ```
 
-上机前需要确认的两个值（脱机无法验证）：
+不要加 `-i`（那会顺带拉起站内 `inference_service`）。需要同步安装包时再显式加 `--sync`。
 
-- `--pose-frame`：默认 `TorsoEe`，另一个可选值是 `TorsoTool`
-- 相机 frame id：默认按 `high/head`、`left`、`right` 关键字匹配 `chain_images`；
-  匹配不出来会报错并列出实际 frame id，此时用
-  `--cam-high / --cam-left-wrist / --cam-right-wrist` 显式指定（frame id 或下标）
+`collect_agent` 要 Tk 窗口；Cursor 终端没有 DISPLAY 时 GUI 挂掉，launch 里它是 `required`，会把整组（含 master）一起杀掉。必须在本机桌面会话里起。
 
-`--max-first-step-jump`（默认 0.15 m）会在动作块第一步离当前位姿过远时拒绝下发，
-用于兜住位姿坐标系、四元数顺序、模型选错这类错误。首次上机不要调大它。
+手写控臂、话题含义和已踩过的坑见 **[docs/ros_control.md](docs/ros_control.md)**。GUI 需切到评测 / `server` 模式（日志出现 `Enable EE pose control mode`）。夹爪命令要按观测顺序一次发齐四个部件，frame 用 `TorsoEE`。
+
+**终端 B（还是那个 Noetic 容器，跑本 client）**
+
+```bash
+cd /data/arianliu/client
+python3 tools/view_cameras.py            # 实时看三路相机，窗口里按 q 退出
+python3 tools/simple_control.py state --debug
+python3 tools/simple_control.py gripper --left 0.0 --right 1.0 --hold-arms --debug --dry-run
+python3 tools/simple_control.py gripper --left 0.0 --right 1.0 --hold-arms --seconds 2 --debug
+python3 tools/probe_xtrainer.py --robot
+python3 tools/probe_xtrainer.py --robot --url ws://<starvla-ip>:10093
+python3 inference_xtrainer.py --url ws://<starvla-ip>:10093 --rate 10 --send-rate 100
+```
+
+宿主机改了 `~/arianliu/client` 之后，同步再进容器：
+
+```bash
+rsync -a --exclude .git ~/arianliu/client/ /data/arianliu/client/
+# 或在宿主机直接 python3 tools/probe_xtrainer.py --robot ，它会 rsync 并 docker exec 进已有 master
+```
+
+### 预检看什么
+
+- `chain images` 应是 `head_orbbec / left_hand_orbbec / right_hand_orbbec`
+- 16 维 state 来自 `multibody_pose` + 夹爪，不是 6 维关节角
+- 夹爪是否真听命令，用 `tools/simple_control.py gripper ... --hold-arms`（见 `docs/ros_control.md`），不要只用 `probe --send-gripper`（缺部件/缺位姿会把 `xtrainer_main` 打挂）
+- `--url` 只握手 + 推一帧，**不发动作**；真正控臂才是 `inference_xtrainer.py`
+
+`--pose-frame` 默认应与观测一致：`TorsoEE`。`--max-first-step-jump` 默认 0.15 m，首次上机不要调大。
+
+GPU 服务端、参数和常见失败见 StarVLA 仓库 `examples/Xtrainer2/INFERENCE.md`。
 
 ## 脱机测试
 
