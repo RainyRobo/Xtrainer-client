@@ -13,3 +13,4 @@ __pycache__/
 .DS_Store
 .python-version
 .live_ros_msgs/
+.tmp_parquet/
