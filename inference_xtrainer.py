@@ -18,11 +18,15 @@ import threading
 import time
 
 import rospy
+import numpy as np
 
 from data_pipeline.tools.robot_ros_client import RobotRosClient
 from vla.xtrainer2_actions import DEFAULT_POSE_FRAME, robot_action_from_16d
 from vla.xtrainer2_contract import CAMERA_ORDER, DEFAULT_INSTRUCTION
 from vla.xtrainer2_policy import PolicyBridge, check_first_step
+from vla.xtrainer2_reset import (
+    INIT_POSES, interpolate_to_target, resolve_init_pose, rotation_deg, state_from_observation,
+)
 
 
 class ActionBuffer:
@@ -85,6 +89,31 @@ def read_observation(client, decoder, start_time):
 def publish(client, vector, pose_frame):
     client.send_action(robot_action_from_16d(
         vector, pose_frame=pose_frame, timestamp=rospy.Time.now().to_sec()))
+
+
+def move_to_init_target(client, send_hz, pose_frame, target, name, duration=2.0):
+    """Stream an interpolated trajectory to ``target`` before inference."""
+    obs = client.get_observation(display_image=False)
+    if obs is None:
+        raise RuntimeError('no /robot/observations; cannot reset to the start pose')
+    current = state_from_observation(obs)
+    left_deg = rotation_deg(current[3:7], target[3:7])
+    right_deg = rotation_deg(current[11:15], target[11:15])
+    left_cm = 100.0 * float(np.linalg.norm(current[0:3] - target[0:3]))
+    right_cm = 100.0 * float(np.linalg.norm(current[8:11] - target[8:11]))
+    n_steps = max(2, int(round(send_hz * duration)))
+    traj = interpolate_to_target(current, target, n_steps)
+    rospy.loginfo(
+        'resetting to init pose %r in frame %r over %.1fs: '
+        'left %.1f cm / %.1f deg, right %.1f cm / %.1f deg',
+        name, pose_frame, duration, left_cm, left_deg, right_cm, right_deg)
+    rate = rospy.Rate(send_hz)
+    for step in traj:
+        if rospy.is_shutdown() or client.action_pub.get_num_connections() == 0:
+            raise RuntimeError('lost /robot/actions subscriber during reset')
+        publish(client, step, pose_frame)
+        rate.sleep()
+    rospy.sleep(1.0)
 
 
 def hold_and_send(client, vector, pose_frame, send_hz, policy_hz):
@@ -193,6 +222,10 @@ def build_argparser():
                              'than this from the current pose (0 disables)')
     parser.add_argument('--bag-path', default='',
                         help='replay observations from a rosbag/mcap instead of the live robot')
+    parser.add_argument('--init-pose', default='default', choices=sorted(INIT_POSES),
+                        help='named start pose to reset to before inference')
+    parser.add_argument('--skip-reset', action='store_true',
+                        help='do not move to the start pose before the first policy command')
     for camera in CAMERA_ORDER:
         parser.add_argument(f'--{camera.replace("_", "-")}', default=None,
                             help=f'chain-image frame id or index for {camera}')
@@ -225,6 +258,10 @@ def main(argv=None):
 
     client = RobotRosClient(frame_id='xtrainer2_inference')
     wait_for_subscriber(client)
+    if not args.skip_reset:
+        move_to_init_target(
+            client, args.send_rate, args.pose_frame,
+            resolve_init_pose(args.init_pose), args.init_pose)
 
     if args.parallel:
         buffer = ActionBuffer()

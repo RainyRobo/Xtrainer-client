@@ -92,6 +92,22 @@ python3 tools/probe_xtrainer.py --robot --url ws://<starvla-ip>:10093
 python3 inference_xtrainer.py --url ws://<starvla-ip>:10093 --rate 10 --send-rate 100
 ```
 
+### 已知可用：pack_phone 评测（2026-09-19）
+
+换了检查点之后，下面这条在 xtrainer2 上能跑通。episode 首帧四元数是 **wxyz**，客户端已转成这台机 `TorsoEE` 的 **xyzw**，用 `--init-pose pack_phone`（episode_000071）。不要用 `--skip-reset`，也不要用 `default`。
+
+```bash
+cd /data/arianliu/client
+python3 inference_xtrainer.py \
+  --url ws://10.41.206.11:10093 \
+  --rate 10 \
+  --init-pose pack_phone \
+  --steps-per-chunk 10 \
+  --instruction "Pick up the phone, place it in the box, and close the lid."
+```
+
+其他任务用 `--init-pose eyebrow`（episode_000076）。新任务把 16 维首帧加进 `vla/xtrainer2_reset.py` 的 `INIT_POSES`。
+
 宿主机改了 `~/arianliu/client` 之后，同步再进容器：
 
 ```bash
